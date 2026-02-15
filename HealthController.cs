@@ -1,4 +1,6 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Amazon.CognitoIdentityProvider;
+
 
 namespace CommitCollect.Api.Controllers;
 
@@ -16,6 +18,11 @@ public class HealthController : ControllerBase
             utc = DateTime.UtcNow
         });
     }
+
+    [HttpGet("debug/di-cognito")]
+    public IActionResult DebugDiCognito([FromServices] IAmazonCognitoIdentityProvider cognito)
+    => Ok(new { ok = true });
+
 }
 
-//
+

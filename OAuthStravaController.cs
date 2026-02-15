@@ -15,12 +15,9 @@ namespace Commitcollect.api.Controllers;
 [Route("oauth/strava")]
 
 
-<<<<<<< Updated upstream
-=======
-//
 
 
->>>>>>> Stashed changes
+
 public class OAuthStravaController : ControllerBase
 {
     private readonly IHttpClientFactory _httpClientFactory;
@@ -45,6 +42,90 @@ public class OAuthStravaController : ControllerBase
         _app = appOptions.Value;
         _config = config;
     }
+
+    // GET /strava/connect
+    // Backend-owned Strava OAuth start (BFF). User resolved via cc_session cookie.
+    [HttpGet("/strava/connect")]
+    public async Task<IActionResult> Connect()
+    {
+        if (string.IsNullOrWhiteSpace(_strava.ClientId))
+            return Problem("Strava ClientId missing. Set Strava:ClientId.");
+
+        if (string.IsNullOrWhiteSpace(_strava.RedirectUri))
+            return Problem("Strava RedirectUri missing. Set Strava:RedirectUri.");
+
+        var sessionsTable = _config["DynamoDb:SessionsTable"]; // env: DynamoDb__SessionsTable
+        if (string.IsNullOrWhiteSpace(sessionsTable))
+            return Problem("DynamoDb:SessionsTable missing from config.");
+
+        // 1) Resolve current user from BFF session cookie
+        if (!Request.Cookies.TryGetValue("cc_session", out var sessionId) || string.IsNullOrWhiteSpace(sessionId))
+            return Unauthorized(new { status = "missing_session" });
+
+        var userId = await GetUserIdFromSessionAsync(sessionsTable, sessionId);
+        if (string.IsNullOrWhiteSpace(userId))
+            return Unauthorized(new { status = "invalid_session" });
+
+        // 2) Create short-lived state mapping (10 minutes)
+        var state = CreateOpaqueState();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var expiresAt = now + 600;
+
+        await _ddb.PutItemAsync(new PutItemRequest
+        {
+            TableName = sessionsTable,
+            Item = new Dictionary<string, AttributeValue>
+            {
+                ["PK"] = new AttributeValue { S = $"STATE#{state}" },
+                ["SK"] = new AttributeValue { S = "META" },
+                ["entityType"] = new AttributeValue { S = "StravaConnectState" },
+                ["userId"] = new AttributeValue { S = userId },
+                ["sessionId"] = new AttributeValue { S = sessionId },
+                ["createdAtUtc"] = new AttributeValue { N = now.ToString() },
+                ["ExpiresAt"] = new AttributeValue { N = expiresAt.ToString() } // TTL attribute
+            }
+        });
+
+        // 3) Redirect to Strava authorize
+        var authorizeUrl =
+            "https://www.strava.com/oauth/authorize" +
+            $"?client_id={Uri.EscapeDataString(_strava.ClientId)}" +
+            $"&redirect_uri={Uri.EscapeDataString(_strava.RedirectUri)}" +
+            $"&response_type=code" +
+            $"&approval_prompt=auto" +
+            $"&scope={Uri.EscapeDataString("read,activity:read_all")}" +
+            $"&state={Uri.EscapeDataString(state)}";
+
+        return Redirect(authorizeUrl);
+    }
+
+    private async Task<string?> GetUserIdFromSessionAsync(string sessionsTable, string sessionId)
+    {
+        var resp = await _ddb.GetItemAsync(new GetItemRequest
+        {
+            TableName = sessionsTable,
+            Key = new Dictionary<string, AttributeValue>
+            {
+                ["PK"] = new AttributeValue { S = $"SESSION#{sessionId}" },
+                ["SK"] = new AttributeValue { S = "META" }
+            },
+            ConsistentRead = true
+        });
+
+        if (resp.Item == null || resp.Item.Count == 0) return null;
+        return resp.Item.TryGetValue("userId", out var v) ? v.S : null;
+    }
+
+    private static string CreateOpaqueState()
+    {
+        // 32 bytes random -> base64url
+        Span<byte> bytes = stackalloc byte[32];
+        RandomNumberGenerator.Fill(bytes);
+        return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+
+
+
 
     // GET /oauth/strava/start?userId=123
     // MVP: userId comes from query string. Later: derive from JWT auth.
@@ -88,15 +169,18 @@ public class OAuthStravaController : ControllerBase
         if (!string.IsNullOrWhiteSpace(error))
             return BadRequest(new { status = "denied", error });
 
-        if (string.IsNullOrWhiteSpace(_oauth.StateSigningKey))
-            return BadRequest(new { status = "missing_state_signing_key" });
-
-
         if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(state))
             return BadRequest(new { status = "missing_code_or_state" });
 
-        if (!TryValidateSignedState(state, out var userId))
-            return BadRequest(new { status = "invalid_state" });
+
+        var sessionsTable = _config["DynamoDb:SessionsTable"]; // env: DynamoDb__SessionsTable
+        if (string.IsNullOrWhiteSpace(sessionsTable))
+            return BadRequest(new { status = "missing_sessions_table" });
+
+        var userId = await ResolveUserIdFromStateAsync(sessionsTable, state);
+        if (string.IsNullOrWhiteSpace(userId))
+            return BadRequest(new { status = "invalid_or_expired_state" });
+
 
         var token = await ExchangeCodeForTokenAsync(code);
 
@@ -110,6 +194,17 @@ public class OAuthStravaController : ControllerBase
         }
 
 
+        await _ddb.DeleteItemAsync(new DeleteItemRequest
+        {
+            TableName = sessionsTable,
+            Key = new Dictionary<string, AttributeValue>
+            {
+                ["PK"] = new AttributeValue { S = $"STATE#{state}" },
+                ["SK"] = new AttributeValue { S = "META" }
+            }
+        });
+
+
         return Ok(new
         {
             status = "connected",
@@ -118,6 +213,24 @@ public class OAuthStravaController : ControllerBase
             expiresAtUtc = token.Expires_At
         });
     }
+
+    private async Task<string?> ResolveUserIdFromStateAsync(string sessionsTable, string state)
+    {
+        var resp = await _ddb.GetItemAsync(new GetItemRequest
+        {
+            TableName = sessionsTable,
+            Key = new Dictionary<string, AttributeValue>
+            {
+                ["PK"] = new AttributeValue { S = $"STATE#{state}" },
+                ["SK"] = new AttributeValue { S = "META" }
+            },
+            ConsistentRead = true
+        });
+
+        if (resp.Item == null || resp.Item.Count == 0) return null;
+        return resp.Item.TryGetValue("userId", out var v) ? v.S : null;
+    }
+
 
 
     private async Task<StravaTokenResponse> ExchangeCodeForTokenAsync(string code)

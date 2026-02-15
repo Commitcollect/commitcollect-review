@@ -1,12 +1,13 @@
 ﻿using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.Core;
 
-//
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
-namespace Commitcollect.StravaWorker.Workers;
+namespace Commitcollect.api.Workers;
 
 /// <summary>
 /// CommitCollect Strava ingestion worker.
@@ -50,12 +51,8 @@ public sealed class StravaIngestionWorker
         _stravaClientSecret = Environment.GetEnvironmentVariable("Strava__ClientSecret") ?? throw new InvalidOperationException("Missing env var Strava__ClientSecret.");
     }
 
-    
-
     public async Task Handler(StravaWebhookEvent evt, ILambdaContext context)
     {
-
-
         // 0) Only ingest activities for MVP
         if (!string.Equals(evt.object_type, "activity", StringComparison.OrdinalIgnoreCase))
         {
@@ -85,7 +82,7 @@ public sealed class StravaIngestionWorker
             return;
         }
 
-        // 3) Refresh token if needed (time-based)
+        // 3) Refresh token if needed
         var accessToken = connection.AccessToken;
         var refreshToken = connection.RefreshToken;
         var expiresAtUtc = connection.ExpiresAtUtc;
@@ -111,30 +108,11 @@ public sealed class StravaIngestionWorker
             return;
         }
 
-        // 5) Fetch activity details from Strava (resilient: 401/403 refresh once, 404 safe)
-        var fetch = await FetchActivityAsync(
-            evt,
-            connection.UserId,
-            athleteId,
-            accessToken,
-            refreshToken,
-            expiresAtUtc,
-            now,
-            context);
-
-        // Persist any token updates (in-memory) for remainder of handler
-        accessToken = fetch.AccessToken;
-        refreshToken = fetch.RefreshToken;
-        expiresAtUtc = fetch.ExpiresAtUtc;
-
-        if (fetch.Activity is null)
-        {
-            context.Logger.LogLine($"Skipping ingestion (activity unavailable/inaccessible) activityId={evt.object_id} athleteId={athleteId} aspect={evt.aspect_type}");
-            return;
-        }
+        // 5) Fetch activity details from Strava
+        var activity = await FetchActivityAsync(evt.object_id, accessToken);
 
         // 6) Project fields into small payloadJson (NO polyline)
-        var projected = ProjectActivity(fetch.Activity.Value);
+        var projected = ProjectActivity(activity);
 
         // 7) Persist workout item (no GSI fields)
         await UpsertWorkoutAsync(connection.UserId, athleteId, evt.object_id, evt.aspect_type, evt.event_time, projected, now);
@@ -162,6 +140,7 @@ public sealed class StravaIngestionWorker
                 {
                     ["IdempotencyKey"] = new AttributeValue { S = key },
                     ["createdAtUtc"] = new AttributeValue { N = nowEpoch.ToString() },
+                    // Your TTL attribute is configured as ttlEpoch
                     ["ttlEpoch"] = new AttributeValue { N = ttlEpoch.ToString() }
                 },
                 ConditionExpression = "attribute_not_exists(IdempotencyKey)"
@@ -214,6 +193,7 @@ public sealed class StravaIngestionWorker
 
     private async Task UpdateConnectionTokensAsync(string userId, long athleteId, string accessToken, string refreshToken, long expiresAtUtc, long nowEpoch)
     {
+        // PK/SK fixed for StravaConnection
         await _ddb.UpdateItemAsync(new UpdateItemRequest
         {
             TableName = _commitCollectTable,
@@ -222,17 +202,7 @@ public sealed class StravaIngestionWorker
                 ["PK"] = new AttributeValue { S = $"USER#{userId}" },
                 ["SK"] = new AttributeValue { S = "STRAVA#CONNECTION" }
             },
-
-
-            UpdateExpression = "SET accessToken = :at, refreshToken = :rt, expiresAtUtc = :ex, updatedAtUtc = :u, athleteId = :aid, #status = :st, #source = :src",
-
-            ExpressionAttributeNames = new Dictionary<string, string>
-            {
-                ["#status"] = "status",
-                ["#source"] = "source"
-            },
-
-
+            UpdateExpression = "SET accessToken = :at, refreshToken = :rt, expiresAtUtc = :ex, updatedAtUtc = :u, athleteId = :aid, status = :st, source = :src",
             ExpressionAttributeValues = new Dictionary<string, AttributeValue>
             {
                 [":at"] = new AttributeValue { S = accessToken },
@@ -250,108 +220,20 @@ public sealed class StravaIngestionWorker
     // Strava API
     // -------------------------
 
-    private sealed record FetchActivityResult(
-        JsonElement? Activity,
-        string AccessToken,
-        string RefreshToken,
-        long ExpiresAtUtc);
-
-    private async Task<FetchActivityResult> FetchActivityAsync(
-        StravaWebhookEvent evt,
-        string userId,
-        long athleteId,
-        string accessToken,
-        string refreshToken,
-        long expiresAtUtc,
-        long nowEpoch,
-        ILambdaContext context)
+    private async Task<JsonElement> FetchActivityAsync(long activityId, string accessToken)
     {
-        var activityId = evt.object_id;
-        var aspect = evt.aspect_type ?? "";
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"https://www.strava.com/api/v3/activities/{activityId}");
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-        var isCreate = string.Equals(aspect, "create", StringComparison.OrdinalIgnoreCase);
+        var resp = await Http.SendAsync(req);
+        var body = await resp.Content.ReadAsStringAsync();
 
-        // Bounded retries only for create (eventual consistency window)
-        var max404Attempts = isCreate ? 3 : 1;
-        var delays = new[] { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(7) };
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Strava GET /activities/{activityId} failed: {(int)resp.StatusCode} {body}");
 
-        var didRefreshOnAuthFailure = false;
-
-        for (var attempt = 1; attempt <= max404Attempts; attempt++)
-        {
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"https://www.strava.com/api/v3/activities/{activityId}");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-
-            var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
-            var body = await resp.Content.ReadAsStringAsync();
-
-            var code = (int)resp.StatusCode;
-            context.Logger.LogLine($"Strava GET /activities/{activityId} => {code} {resp.ReasonPhrase} (attempt {attempt}/{max404Attempts})");
-
-            // 401/403: refresh once + retry once
-            if ((resp.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                 resp.StatusCode == System.Net.HttpStatusCode.Forbidden) &&
-                !didRefreshOnAuthFailure)
-            {
-                didRefreshOnAuthFailure = true;
-
-                context.Logger.LogLine($"Strava auth failure ({code}) for activityId={activityId}. Forcing token refresh and retrying once.");
-
-                var refreshed = await RefreshAccessTokenAsync(refreshToken);
-
-                accessToken = refreshed.access_token;
-                refreshToken = refreshed.refresh_token;
-                expiresAtUtc = refreshed.expires_at;
-
-                await UpdateConnectionTokensAsync(userId, athleteId, accessToken, refreshToken, expiresAtUtc, nowEpoch);
-
-                attempt--; // retry immediately with new token
-                continue;
-            }
-
-            // still 401/403 after refresh => inaccessible, graceful exit
-            if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                resp.StatusCode == System.Net.HttpStatusCode.Forbidden)
-            {
-                context.Logger.LogLine($"Strava still unauthorized/forbidden after refresh. Treating activity as inaccessible. Body={Truncate(body, 400)}");
-                return new FetchActivityResult(null, accessToken, refreshToken, expiresAtUtc);
-            }
-
-            // 404: retry only for create, otherwise graceful exit
-            if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
-            {
-                context.Logger.LogLine($"Strava 404 for activityId={activityId} (aspect={aspect}). Body={Truncate(body, 300)}");
-
-                if (attempt < max404Attempts)
-                {
-                    await Task.Delay(delays[Math.Min(attempt - 1, delays.Length - 1)]);
-                    continue;
-                }
-
-                return new FetchActivityResult(null, accessToken, refreshToken, expiresAtUtc);
-            }
-
-            // 429: treat as graceful exit (or later route to DLQ)
-            if (resp.StatusCode == (System.Net.HttpStatusCode)429)
-            {
-                context.Logger.LogLine($"Strava 429 rate limited for activityId={activityId}. Body={Truncate(body, 300)}");
-                return new FetchActivityResult(null, accessToken, refreshToken, expiresAtUtc);
-            }
-
-            if (!resp.IsSuccessStatusCode)
-            {
-                throw new InvalidOperationException($"Strava GET /activities/{activityId} failed: {code} {Truncate(body, 800)}");
-            }
-
-            using var doc = JsonDocument.Parse(body);
-            return new FetchActivityResult(doc.RootElement.Clone(), accessToken, refreshToken, expiresAtUtc);
-        }
-
-        return new FetchActivityResult(null, accessToken, refreshToken, expiresAtUtc);
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.Clone();
     }
-
-    private static string Truncate(string s, int max)
-        => string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max) + "...";
 
     private async Task<(string access_token, string refresh_token, long expires_at)> RefreshAccessTokenAsync(string refreshToken)
     {
@@ -385,11 +267,13 @@ public sealed class StravaIngestionWorker
 
     private static ProjectedActivity ProjectActivity(JsonElement a)
     {
+        // Helper getters (safe-ish)
         static string? S(JsonElement e, string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
         static double? D(JsonElement e, string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
         static long? L(JsonElement e, string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt64() : null;
         static bool? B(JsonElement e, string name) => e.TryGetProperty(name, out var v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False) ? v.GetBoolean() : null;
 
+        // sport_type preferred (Strava newer), fallback to type
         var sportType = S(a, "sport_type") ?? S(a, "type") ?? "Unknown";
 
         return new ProjectedActivity
@@ -447,6 +331,7 @@ public sealed class StravaIngestionWorker
     {
         var payloadJson = JsonSerializer.Serialize(projected);
 
+        // Also store extracted fields at top-level (fast queries)
         var startDateUtcEpoch = TryParseStartDateToEpoch(projected.start_date);
 
         var item = new Dictionary<string, AttributeValue>
@@ -475,6 +360,8 @@ public sealed class StravaIngestionWorker
             ["ingestedAtUtc"] = new AttributeValue { N = nowEpoch.ToString() },
             ["updatedAtUtc"] = new AttributeValue { N = nowEpoch.ToString() }
         };
+
+        // IMPORTANT: Do NOT include GSI1PK/GSI1SK here. Leave them absent.
 
         await _ddb.PutItemAsync(new PutItemRequest
         {
@@ -505,6 +392,7 @@ public sealed class StravaIngestionWorker
             ["eventTimeUtc"] = new AttributeValue { N = eventTime.ToString() },
 
             ["status"] = new AttributeValue { S = "DELETED" },
+
             ["payloadJson"] = new AttributeValue { S = "{}" },
 
             ["ingestedAtUtc"] = new AttributeValue { N = nowEpoch.ToString() },

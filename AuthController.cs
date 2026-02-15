@@ -12,7 +12,7 @@ public class AuthController : ControllerBase
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IAmazonDynamoDB _ddb;
     private readonly IConfiguration _config;
-    
+
     public AuthController(IHttpClientFactory httpClientFactory, IAmazonDynamoDB ddb, IConfiguration config)
     {
         _httpClientFactory = httpClientFactory;
@@ -20,7 +20,6 @@ public class AuthController : ControllerBase
         _config = config;
     }
 
-    //
 
     [HttpGet("debug/config")]
     public IActionResult DebugConfig()

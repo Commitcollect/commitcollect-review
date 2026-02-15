@@ -1,11 +1,10 @@
 ﻿using Amazon.Lambda;
 using Amazon.Lambda.Model;
+using System;
 using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
-
-//
 
 namespace Commitcollect.api.Controllers;
 
@@ -58,14 +57,20 @@ public class StravaWebhookController : ControllerBase
 
         // Strava requires fast response. Enqueue and return OK immediately.
         // Keep payload minimal: worker does idempotency + lookup + fetch + store.
+        var eventTime = ev.EventTime > 0 ? ev.EventTime : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var correlationId = $"strava:{ev.SubscriptionId}:{ev.OwnerId}:{ev.ObjectId}:{eventTime}";
+
+        Console.WriteLine($"[StravaWebhook] correlation_id={correlationId} aspect={aspect} object_id={ev.ObjectId} owner_id={ev.OwnerId}");
+
         var payload = new
         {
             source = "STRAVA",
+            correlation_id = correlationId,
             object_type = ev.ObjectType,
             object_id = ev.ObjectId,
             aspect_type = aspect,               // normalized
             owner_id = ev.OwnerId,
-            event_time = ev.EventTime > 0 ? ev.EventTime : DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            event_time = eventTime,
             subscription_id = ev.SubscriptionId,
             updates = ev.Updates               // optional
         };
@@ -79,15 +84,13 @@ public class StravaWebhookController : ControllerBase
     // =========================================================
     private async Task EnqueueToWorkerAsync(object payload)
     {
-        // Environment variable Strava__WorkerFunctionName maps to config Strava:WorkerFunctionName
-        var workerName =
-            _config["Strava:WorkerFunctionName"] ??
-            _config["Strava__WorkerFunctionName"] ??
-            System.Environment.GetEnvironmentVariable("Strava__WorkerFunctionName");
+        // Strava__WorkerFunctionName maps to config key: "Strava:WorkerFunctionName"
+        var workerName = _config["Strava:WorkerFunctionName"];
 
         if (string.IsNullOrWhiteSpace(workerName))
             throw new InvalidOperationException(
-                "Missing Strava worker function name. Set Strava__WorkerFunctionName env var.");
+                "Missing Strava:WorkerFunctionName configuration. " +
+                "Set env var Strava__WorkerFunctionName.");
 
         var json = JsonSerializer.Serialize(payload);
 
